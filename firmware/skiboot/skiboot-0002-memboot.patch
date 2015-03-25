@@ -1,0 +1,334 @@
+commit 8d4a4877054de5f9a534cf743b538fd18551db90
+Author: Alistair Popple <alistair@popple.id.au>
+Date:   Tue Feb 24 12:29:46 2015 +1100
+
+    memboot: Add a memboot flash backend
+    
+    memboot uses bmc system memory instead of a real flash chip. This
+    patch adds a flash backend for bmc system memory to allow use of the
+    memboot tool (in external/memboot) to boot the system.
+    
+    Signed-off-by: Alistair Popple <alistair@popple.id.au>
+
+diff --git a/external/memboot/memboot.c b/external/memboot/memboot.c
+index fa42ea9..848c5fe 100644
+--- a/external/memboot/memboot.c
++++ b/external/memboot/memboot.c
+@@ -33,6 +33,10 @@
+ #define LPC_HICR6		0x80
+ #define LPC_HICR7		0x88
+ #define LPC_HICR8		0x8c
++#define LPC_SCR0SIO		0x170
++
++#define MEMBOOT_SIO_VERSION_FLAG 0x42
++#define MEMBOOT_SIO_FLAG	(0x10 << 8)
+ 
+ uint32_t readl(void *addr)
+ {
+@@ -97,6 +101,7 @@ int main(int argc, char *argv[])
+ {
+ 	int mem_fd;
+ 	void *lpcreg;
++	uint32_t lpc_scr0sio_val;
+ 	uint32_t lpc_hicr7_val = (FLASH_IMG_BASE | 0xe00);
+ 
+ 	if (argc > 2) {
+@@ -117,9 +122,17 @@ int main(int argc, char *argv[])
+ 		exit(1);
+ 	}
+ 
++	lpc_scr0sio_val = readl(lpcreg+LPC_SCR0SIO);
++	lpc_scr0sio_val &= ~0xff;
++	lpc_scr0sio_val |= MEMBOOT_SIO_VERSION_FLAG;
++	lpc_scr0sio_val &= ~MEMBOOT_SIO_FLAG;
++
+ 	if (argc == 2) {
+ 		boot_firmware_image(mem_fd, argv[1]);
+ 		lpc_hicr7_val = (MEM_IMG_BASE | 0xe00);
++
++		/* Set the boot mode scratch register to indicate a memboot */
++		lpc_scr0sio_val |= MEMBOOT_SIO_FLAG;
+ 		printf("Booting from memory after power cycle\n");
+ 	}
+ 
+@@ -128,6 +141,10 @@ int main(int argc, char *argv[])
+ 		writel(lpc_hicr7_val, lpcreg+LPC_HICR7);
+ 	}
+ 
++	/* Set the magic value */
++	writel(0x42, lpcreg+LPC_SCR0SIO);
++
++	writel(lpc_scr0sio_val, lpcreg+LPC_SCR0SIO);
+ 	printf("LPC_HICR7 = 0x%x\n", lpc_hicr7_val);
+ 	return 0;
+ }
+diff --git a/hw/ast-bmc/ast-io.c b/hw/ast-bmc/ast-io.c
+index 34b588d..08ce99d 100644
+--- a/hw/ast-bmc/ast-io.c
++++ b/hw/ast-bmc/ast-io.c
+@@ -58,7 +58,7 @@
+  * flash from IDSEL 0 as follow:
+  *
+  * ADRBASE=0x3000 HWMBASE=0x0e00 for 32MB
+- * ADRMASK=0xfe00 HWNCARE=0x01ff 
++ * ADRMASK=0xfe00 HWNCARE=0x01ff
+  *
+  * Which means mapping of   LPC 0x0e000000..0x0fffffff onto
+  *                          AHB 0x30000000..0x31ffffff
+@@ -83,14 +83,20 @@
+  * we'll only do that after the boot script/program on the BMC is
+  * updated to restore the bridge to a state compatible with the SBE
+  * expectations on boot.
+- */ 
+- 
++ */
++
+ #include <skiboot.h>
+ #include <lpc.h>
+ #include <lock.h>
+ 
+ #include "ast.h"
+ 
++#define BMC_SIO_SCR28 0x28
++#define BOOT_FLAGS_VERSION 0x42
++
++#define BMC_SIO_SCR29 0x29
++#define BMC_SIO_SCR29_MEMBOOT 0x10
++
+ enum {
+ 	BMC_SIO_DEV_NONE	= -1,
+ 	BMC_SIO_DEV_UART1	= 2,
+@@ -197,7 +203,7 @@ static uint32_t bmc_sio_ahb_readl(uint32_t reg)
+ 
+ 	bmc_sio_ahb_prep(reg, 2);
+ 
+-	/* Trigger */	
++	/* Trigger */
+ 	bmc_sio_inb(0xfe);
+ 
+ 	/* Read results */
+@@ -241,7 +247,7 @@ int ast_copy_to_ahb(uint32_t reg, const void *src, uint32_t len)
+ 	if ((reg ^ (reg + len - 1)) >> 28)
+ 		return -EINVAL;
+ 
+-	/* SPI flash, use LPC->AHB bridge */	
++	/* SPI flash, use LPC->AHB bridge */
+ 	if ((reg >> 28) == (PNOR_AHB_ADDR >> 28)) {
+ 		uint32_t chunk, off = reg - PNOR_AHB_ADDR + pnor_lpc_offset;
+ 		int64_t rc;
+@@ -382,6 +388,19 @@ void ast_io_init(void)
+ 	ast_setup_sio_irq_polarity();
+ }
+ 
++bool ast_is_ahb_lpc_pnor(void)
++{
++	uint8_t boot_version;
++	uint8_t boot_flags;
++
++	boot_version = bmc_sio_inb(BMC_SIO_SCR28);
++	if (boot_version != BOOT_FLAGS_VERSION)
++		return true;
++
++	boot_flags = bmc_sio_inb(BMC_SIO_SCR29);
++	return !(boot_flags & BMC_SIO_SCR29_MEMBOOT);
++}
++
+ void ast_setup_ibt(uint16_t io_base, uint8_t irq)
+ {
+ 	uint32_t v;
+diff --git a/hw/ast-bmc/ast-sf-ctrl.c b/hw/ast-bmc/ast-sf-ctrl.c
+index 06287a8..eee18e1 100644
+--- a/hw/ast-bmc/ast-sf-ctrl.c
++++ b/hw/ast-bmc/ast-sf-ctrl.c
+@@ -672,7 +672,7 @@ static int ast_sf_setup_micron(struct ast_sf_ctrl *ct, struct flash_info *info)
+ 
+ static int ast_sf_setup(struct spi_flash_ctrl *ctrl, uint32_t *tsize)
+ {
+-	struct ast_sf_ctrl *ct = container_of(ctrl, struct ast_sf_ctrl, ops);	
++	struct ast_sf_ctrl *ct = container_of(ctrl, struct ast_sf_ctrl, ops);
+ 	struct flash_info *info = ctrl->finfo;
+ 
+ 	(void)tsize;
+@@ -681,7 +681,7 @@ static int ast_sf_setup(struct spi_flash_ctrl *ctrl, uint32_t *tsize)
+ 	 * Configure better timings and read mode for known
+ 	 * flash chips
+ 	 */
+-	switch(info->id) {		
++	switch(info->id) {
+ 	case 0xc22019: /* MX25L25635F */
+ 	case 0xc2201a: /* MX66L51235F */
+ 		return ast_sf_setup_macronix(ct, info);
+@@ -787,11 +787,69 @@ static bool ast_sf_init_bmc(struct ast_sf_ctrl *ct)
+ 	return true;
+ }
+ 
++static int ast_mem_set4b(struct spi_flash_ctrl *ctrl __unused,
++			 bool enable __unused)
++{
++	return 0;
++}
++
++static int ast_mem_setup(struct spi_flash_ctrl *ctrl __unused,
++			 uint32_t *tsize __unused)
++{
++	return 0;
++}
++
++static int ast_mem_chipid(struct spi_flash_ctrl *ctrl __unused, uint8_t *id_buf,
++			  uint32_t *id_size)
++{
++	if (*id_size < 3)
++		return -1;
++
++	id_buf[0] = 0xaa;
++	id_buf[1] = 0x55;
++	id_buf[2] = 0xaa;
++	*id_size = 3;
++	return 0;
++}
++
++static int ast_mem_write(struct spi_flash_ctrl *ctrl, uint32_t pos,
++			const void *buf, uint32_t len)
++{
++	struct ast_sf_ctrl *ct = container_of(ctrl, struct ast_sf_ctrl, ops);
++
++	/*
++	 * This only works when the ahb is pointed at system memory.
++	 */
++	return ast_copy_to_ahb(ct->flash + pos, buf, len);
++}
++
++static int ast_mem_erase(struct spi_flash_ctrl *ctrl, uint32_t addr, uint32_t size)
++{
++	struct ast_sf_ctrl *ct = container_of(ctrl, struct ast_sf_ctrl, ops);
++	uint32_t pos, len, end = addr + size;
++	uint64_t zero = 0;
++	int ret;
++
++	for (pos = addr; pos < end; pos += sizeof(zero)) {
++		if (pos + sizeof(zero) > end)
++			len = end - pos;
++		else
++			len = sizeof(zero);
++
++		ret = ast_copy_to_ahb(ct->flash + pos, &zero, len);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ int ast_sf_open(uint8_t type, struct spi_flash_ctrl **ctrl)
+ {
+ 	struct ast_sf_ctrl *ct;
+ 
+-	if (type != AST_SF_TYPE_PNOR && type != AST_SF_TYPE_BMC)
++	if (type != AST_SF_TYPE_PNOR && type != AST_SF_TYPE_BMC
++	    && type != AST_SF_TYPE_MEM)
+ 		return -EINVAL;
+ 
+ 	*ctrl = NULL;
+@@ -802,18 +860,31 @@ int ast_sf_open(uint8_t type, struct spi_flash_ctrl **ctrl)
+ 	}
+ 	memset(ct, 0, sizeof(*ct));
+ 	ct->type = type;
+-	ct->ops.cmd_wr = ast_sf_cmd_wr;
+-	ct->ops.cmd_rd = ast_sf_cmd_rd;
+-	ct->ops.set_4b = ast_sf_set_4b;
+-	ct->ops.read = ast_sf_read;
+-	ct->ops.setup = ast_sf_setup;
++
++	if (type == AST_SF_TYPE_MEM) {
++		ct->ops.cmd_wr = NULL;
++		ct->ops.cmd_rd = NULL;
++		ct->ops.read = ast_sf_read;
++		ct->ops.set_4b = ast_mem_set4b;
++		ct->ops.write = ast_mem_write;
++		ct->ops.erase = ast_mem_erase;
++		ct->ops.setup = ast_mem_setup;
++		ct->ops.chip_id = ast_mem_chipid;
++		ct->flash = PNOR_FLASH_BASE;
++	} else {
++		ct->ops.cmd_wr = ast_sf_cmd_wr;
++		ct->ops.cmd_rd = ast_sf_cmd_rd;
++		ct->ops.set_4b = ast_sf_set_4b;
++		ct->ops.read = ast_sf_read;
++		ct->ops.setup = ast_sf_setup;
++	}
+ 
+ 	ast_get_ahb_freq();
+ 
+ 	if (type == AST_SF_TYPE_PNOR) {
+ 		if (!ast_sf_init_pnor(ct))
+ 			goto fail;
+-	} else {
++	} else if (type == AST_SF_TYPE_BMC) {
+ 		if (!ast_sf_init_bmc(ct))
+ 			goto fail;
+ 	}
+@@ -843,4 +914,3 @@ void ast_sf_close(struct spi_flash_ctrl *ctrl)
+ 	/* Free the whole lot */
+ 	free(ct);
+ }
+-
+diff --git a/include/ast.h b/include/ast.h
+index efc898d..58adb6c 100644
+--- a/include/ast.h
++++ b/include/ast.h
+@@ -72,6 +72,7 @@ int ast_copy_to_ahb(uint32_t reg, const void *src, uint32_t len);
+ int ast_copy_from_ahb(void *dst, uint32_t reg, uint32_t len);
+ 
+ void ast_io_init(void);
++bool ast_is_ahb_lpc_pnor(void);
+ 
+ /* UART configuration */
+ 
+@@ -90,6 +91,7 @@ void ast_setup_ibt(uint16_t io_base, uint8_t irq);
+  */
+ #define AST_SF_TYPE_PNOR	0
+ #define AST_SF_TYPE_BMC		1
++#define AST_SF_TYPE_MEM		2
+ 
+ struct spi_flash_ctrl;
+ int ast_sf_open(uint8_t type, struct spi_flash_ctrl **ctrl);
+diff --git a/libflash/libflash.c b/libflash/libflash.c
+index 5badbff..9d07694 100644
+--- a/libflash/libflash.c
++++ b/libflash/libflash.c
+@@ -28,6 +28,7 @@ static const struct flash_info flash_info[] = {
+                                 FL_ERASE_BULK | FL_MICRON_BUGS,
+                                                           "Micron N25Qx512Ax"   },
+ 	{ 0x55aa55, 0x00100000, FL_ERASE_ALL | FL_CAN_4B, "TEST_FLASH" },
++	{ 0xaa55aa, 0x02000000, FL_ERASE_ALL | FL_CAN_4B, "EMULATED_FLASH"},
+ };
+ 
+ struct flash_chip {
+diff --git a/platforms/astbmc/pnor.c b/platforms/astbmc/pnor.c
+index c64f41e..8e88edd 100644
+--- a/platforms/astbmc/pnor.c
++++ b/platforms/astbmc/pnor.c
+@@ -30,8 +30,16 @@ int pnor_init(void)
+ 	struct flash_chip *pnor_chip;
+ 	int rc;
+ 
+-	/* Open controller and flash */
+-	rc = ast_sf_open(AST_SF_TYPE_PNOR, &pnor_ctrl);
++	/* Open controller and flash. If the LPC->AHB doesn't point to
++	 * the PNOR flash base we assume we're booting from BMC system
++	 * memory (or some other place setup by the BMC to support LPC
++	 * FW reads & writes). */
++	if (ast_is_ahb_lpc_pnor())
++		rc = ast_sf_open(AST_SF_TYPE_PNOR, &pnor_ctrl);
++	else {
++		printf("PLAT: Memboot detected\n");
++		rc = ast_sf_open(AST_SF_TYPE_MEM, &pnor_ctrl);
++	}
+ 	if (rc) {
+ 		prerror("PLAT: Failed to open PNOR flash controller\n");
+ 		goto fail;
+@@ -54,4 +62,3 @@ int pnor_init(void)
+ 
+ 	return rc;
+ }
+-
